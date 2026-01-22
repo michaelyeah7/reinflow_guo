@@ -67,7 +67,8 @@ class PPOFlow(nn.Module):
                  noise_hidden_dims,
                  logprob_debug_sample,
                  logprob_debug_recalculate,
-                 explore_net_activation_type
+                 explore_net_activation_type,
+                 noise_level_a=0.6
                  ):
         
         super().__init__()
@@ -115,6 +116,9 @@ class PPOFlow(nn.Module):
         self.use_time_independent_noise=use_time_independent_noise
         self.noise_hidden_dims=noise_hidden_dims
         self.explore_net_activation_type=explore_net_activation_type
+        
+        # Noise level coefficient: λ_t = a * (1 - t) per FMPO framework
+        self.noise_level_a = noise_level_a
         
         self.actor_old: FlowMLP = policy
         self.load_policy(actor_policy_path, use_ema=True)  # it was false for previous experiments for hopper walker halfcheetah
@@ -249,9 +253,6 @@ class PPOFlow(nn.Module):
         
         steps = torch.linspace(0, 1 - dt, self.inference_steps).repeat(B, 1).to(self.device)  # [B, K]
         
-        # Noise level coefficient: λ_t = a * (1 - t) per FMPO framework
-        noise_level_a = 0.6
-        
         for i in range(self.inference_steps):
             t = steps[:, i]  # (B,)
             t_bc = t.view(-1, 1)  # (B, 1) for broadcasting with (B, H*A)
@@ -265,7 +266,7 @@ class PPOFlow(nn.Module):
             
             # Compute λ_t = a * (1 - t) per FMPO framework (Table 1)
             one_minus_t = torch.clamp(1 - t_bc, min=1e-6)
-            lambda_t = noise_level_a * one_minus_t
+            lambda_t = self.noise_level_a * one_minus_t
             
             # Compute drift coefficients per Theorem 4.1
             coef_vel = 1.0 + (lambda_t / 2.0) * (t_bc / one_minus_t)
@@ -383,9 +384,6 @@ class PPOFlow(nn.Module):
         if save_chains:
             x_chain[:, 0] = xt
         
-        # Noise level coefficient: λ_t = a * (1 - t) per FMPO framework
-        noise_level_a = 0.6
-        
         for i in range(self.inference_steps):
             t = steps[:, i]  # (B,)
             t_bc = t.view(-1, 1, 1)  # (B, 1, 1) for broadcasting with (B, H, A)
@@ -395,7 +393,7 @@ class PPOFlow(nn.Module):
             
             # Compute λ_t = a * (1 - t) per FMPO framework (Table 1)
             one_minus_t = torch.clamp(1 - t_bc, min=1e-6)
-            lambda_t = noise_level_a * one_minus_t
+            lambda_t = self.noise_level_a * one_minus_t
             
             # Compute drift coefficients per Theorem 4.1:
             # dZ = [(1 + λ/2 * t/(1-t)) * v - (λ/2 * 1/(1-t)) * Z] dt + √λ dW

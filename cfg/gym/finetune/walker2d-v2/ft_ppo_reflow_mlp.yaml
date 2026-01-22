@@ -47,6 +47,7 @@ wandb:
   project: gym-${env_name}-finetune
   run: ${now:%Y-%m-%d}_${now:%H-%M-%S}_${name}
   offline_mode: false
+  dir: null
 train:
   n_train_itr: 1001
   n_critic_warmup_itr: 5
@@ -134,3 +135,4 @@ model:
   logprob_debug_sample: false
   logprob_debug_recalculate: false
   explore_net_activation_type: Tanh
+  noise_level_a: 0.6
