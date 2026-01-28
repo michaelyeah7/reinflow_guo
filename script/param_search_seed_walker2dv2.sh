@@ -1,27 +1,27 @@
 #!/bin/bash
-# Seed search script for ant-v2 environment
+# Seed search script for walker2d-v2 environment
 # Runs training with 10 different seeds (42-51)
 
 # Base command
-BASE_CMD="python script/run.py --config-dir=cfg/gym/finetune/ant-v2 --config-name=ft_ppo_reflow_mlp"
+BASE_CMD="python script/run.py --config-dir=cfg/gym/finetune/walker2d-v2 --config-name=ft_ppo_reflow_mlp"
 
 # Environment name
-ENV_NAME="ant-v2"
+ENV_NAME="walker2d-v2"
 
 # Base parameters (you can modify these)
-BASE_PARAMS="min_std=0.08 max_std=0.16 train.ent_coef=0.03 wandb.offline_mode=True"
+BASE_PARAMS="min_std=0.10 max_std=0.24 train.ent_coef=0.03 wandb.offline_mode=True"
 
 # Seed range (10 seeds: 42-51)
-# SEEDS=(42 43 44 45 46 47 48 49 50 51)
-SEEDS=(49)
+SEEDS=(44 45 46 47 48 49 50 51)
+
 # Create results directory
 RESULTS_DIR="seed_search_results"
 mkdir -p "$RESULTS_DIR"
 
 # Log file
-LOG_FILE="$RESULTS_DIR/seed_search_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$RESULTS_DIR/seed_search_walker2dv2_$(date +%Y%m%d_%H%M%S).log"
 
-echo "Starting seed search for ant-v2 environment"
+echo "Starting seed search for walker2d-v2 environment"
 echo "Seeds: ${SEEDS[*]}"
 echo "Results will be logged to: $LOG_FILE"
 echo ""

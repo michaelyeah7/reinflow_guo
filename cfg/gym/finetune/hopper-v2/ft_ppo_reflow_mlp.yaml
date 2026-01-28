@@ -136,4 +136,4 @@ model:
   logprob_debug_sample: false
   logprob_debug_recalculate: false
   explore_net_activation_type: Tanh
-  noise_level_a: 0.6
+  noise_level_a: 0.5

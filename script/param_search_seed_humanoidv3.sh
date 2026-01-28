@@ -12,7 +12,7 @@ ENV_NAME="Humanoid-v3"
 BASE_PARAMS="min_std=0.08 max_std=0.16 train.ent_coef=0.03 wandb.offline_mode=True"
 
 # Seed range (10 seeds: 42-51)
-SEEDS=(42 43 44 45 46 47 48 49 50 51)
+SEEDS=(47)
 
 # Create results directory
 RESULTS_DIR="seed_search_results"

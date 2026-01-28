@@ -7,7 +7,7 @@ act_steps: 4
 # observation history
 obs_dim: 17
 cond_steps: 1
-###################################################################d
+###################################################################
 defaults:
   - _self_
 hydra:
@@ -136,3 +136,4 @@ model:
   logprob_debug_recalculate: false
   explore_net_activation_type: Tanh
   noise_level_a: 0.6
+
