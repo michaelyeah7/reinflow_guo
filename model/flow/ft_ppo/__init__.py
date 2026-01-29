@@ -20,4 +20,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Import both PPOFlow implementations for easy access
+# - PPOFlow: Original ReinFlow implementation (from ppoflow.py)
+# - PPOFlowFMPO: FMPO implementation with tunable noise schedule (from ppoflow_fmppo.py)
+#
+# Usage in config files:
+#   For ReinFlow (original):  model._target_: model.flow.ft_ppo.ppoflow.PPOFlow
+#   For FMPO-PPO:             model._target_: model.flow.ft_ppo.ppoflow_fmppo.PPOFlow
 
+from model.flow.ft_ppo.ppoflow import PPOFlow
+from model.flow.ft_ppo.ppoflow_fmppo import PPOFlow as PPOFlowFMPO
+
+__all__ = ['PPOFlow', 'PPOFlowFMPO']

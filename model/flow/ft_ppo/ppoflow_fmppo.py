@@ -68,12 +68,10 @@ class PPOFlow(nn.Module):
                  logprob_debug_sample,
                  logprob_debug_recalculate,
                  explore_net_activation_type,
-                 noise_level_a=None  # Accepted but ignored for compatibility with FMPO config
+                 noise_level_a=0.6
                  ):
-
+        
         super().__init__()
-        # Note: noise_level_a is ignored in this implementation.
-        # It exists only for config compatibility with FMPO-PPO.
         self.device = device
         self.inference_steps = inference_steps          # number of steps for inference.
         self.ft_denoising_steps = ft_denoising_steps    # could be adjusted
@@ -118,6 +116,9 @@ class PPOFlow(nn.Module):
         self.use_time_independent_noise=use_time_independent_noise
         self.noise_hidden_dims=noise_hidden_dims
         self.explore_net_activation_type=explore_net_activation_type
+        
+        # Noise level coefficient: λ_t = a * (1 - t) per FMPO framework
+        self.noise_level_a = noise_level_a
         
         self.actor_old: FlowMLP = policy
         self.load_policy(actor_policy_path, use_ema=True)  # it was false for previous experiments for hopper walker halfcheetah
@@ -208,85 +209,110 @@ class PPOFlow(nn.Module):
                      get_chains_stds=True
                      ):
         '''
+        Computes log probability consistent with Theorem 4.1.
+        
+        The transition distribution follows the SDE:
+        dZ_t = [(1 + λ_t/2 * t/(1-t)) * u_θ(Z_t, t) - (λ_t/2 * 1/(1-t)) * Z_t] dt + √λ_t dW_t
+        
+        In discrete form:
+        Z_{t+dt} ~ N(Z_t + drift * dt, λ_t * dt)
+        where drift = (1 + λ/2 * t/(1-t)) * v - (λ/2 * 1/(1-t)) * Z
+        
         inputs:
             x_chain: torch.Tensor of shape `[batchsize, self.inference_steps+1, self.horizon_steps, self.action_dim]`
            
         outputs:
             log_prob. tensor of shape `[batchsize]`
             entropy_rate_est: tensor of shape `[batchsize]`
-            chains_stds.mean(): tensor of shape `[batchsize]`
-            
-        explanation:
-            p(x0|s)       = N(x0|0, 1)
-            p(xt+1|xt, s) = N(xt+1 | xt + v(xt, s)1/K; sigma_t^2)
-            
-            log p(xK|s) = log p(x0) + \sum_{t=0}^{K-1} log p(xt+1|xt, s)
-            H(X0:K)     = H(x0|s)     + \sum_{t=0}^{K-1} H(Xt+1|X_t, s)
-            entropy rate H(X) = H(X0:K)/(K+1) asymptotically converges to the entropy per symbol when K goes to infinity.
-            we view the actions at each dimension and horizon as conditionally independent on the state s and previous action. (open-loop execution)
+            chains_stds.mean(): scalar tensor
         '''
         logprob = 0.0
-        joint_entropy=0.0 
-        entropy_rate_est=0.0
+        joint_entropy = 0.0 
+        entropy_rate_est = 0.0
         logprob_steps = 0
         
         B = x_chain.shape[0]
-        chains_prev = x_chain[:, :-1,:, :].flatten(-2,-1)                       # [batchsize, self.inference_steps, self.horizon_steps x self.action_dim]
-        chains_next = x_chain[:, 1:, :, :].flatten(-2,-1)                       # [batchsize, self.inference_steps, self.horizon_steps x self.action_dim]
-        chains_stds = torch.zeros_like(chains_prev, device=self.device)         # [batchsize, self.inference_steps, self.horizon_steps x self.action_dim]
+        dt = 1.0 / self.inference_steps
+        sqrt_dt = dt ** 0.5
         
-        # initial probability
-        init_dist = Normal(torch.zeros(B, self.horizon_steps* self.action_dim, device=self.device), 1.0)
-        logprob_init = init_dist.log_prob(x_chain[:,0].reshape(B,-1)).sum(-1)   # [batchsize]
+        chains_prev = x_chain[:, :-1, :, :].flatten(-2, -1)  # [B, K, H*A]
+        chains_next = x_chain[:, 1:, :, :].flatten(-2, -1)   # [B, K, H*A]
+        chains_stds = torch.zeros_like(chains_prev, device=self.device)  # [B, K, H*A]
+        chains_mean = torch.zeros_like(chains_prev, device=self.device)  # [B, K, H*A]
+        
+        # initial probability p(x_0) = N(0, I)
+        init_dist = Normal(torch.zeros(B, self.horizon_steps * self.action_dim, device=self.device), 1.0)
+        logprob_init = init_dist.log_prob(x_chain[:, 0].reshape(B, -1)).sum(-1)  # [B]
         if get_entropy:
-            entropy_init = init_dist.entropy().sum(-1)                          # [batchsize]
+            entropy_init = init_dist.entropy().sum(-1)  # [B]
         if account_for_initial_stochasticity:
-            logprob+=logprob_init
+            logprob += logprob_init
             if get_entropy:
-                joint_entropy+=entropy_init
-            logprob_steps+=1
+                joint_entropy += entropy_init
+            logprob_steps += 1
         
-        # transition probabilities
-        chains_vel  = torch.zeros_like(chains_prev, device=self.device)         # [batchsize, self.inference_steps, self.horizon_steps x self.action_dim]
-
-        dt = 1.0/self.inference_steps
-        steps = torch.linspace(0, 1-dt, self.inference_steps).repeat(B, 1).to(self.device)  # [batchsize, self.inference_steps]. the points sampled by linspace include the left and right boundaries. so we use 1-dt as the right boundary.  
+        steps = torch.linspace(0, 1 - dt, self.inference_steps).repeat(B, 1).to(self.device)  # [B, K]
+        
         for i in range(self.inference_steps):
-            t       = steps[:,i]
-            xt      = x_chain[:,i]                                              # [batchsize, self.horizon_steps , self.action_dim]
-            vt, nt  =self.actor_ft.forward(xt, t, cond, True, i)                # [batchsize, self.horizon_steps, self.action_dim]
-            chains_vel[:,i]  = vt.flatten(-2,-1)                                # [batchsize, self.horizon_steps x self.action_dim]
-            chains_stds[:,i] = nt                                               # [batchsize, self.horizon_steps x self.action_dim]
-            logprob_steps+=1
-        chains_mean = (chains_prev + chains_vel * dt)                           # [batchsize, self.inference_steps, self.horizon_steps x self.action_dim]
-        if clip_intermediate_actions:
-            chains_mean = chains_mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+            t = steps[:, i]  # (B,)
+            t_bc = t.view(-1, 1)  # (B, 1) for broadcasting with (B, H*A)
+            
+            xt = x_chain[:, i]  # (B, H, A)
+            xt_flat = chains_prev[:, i]  # (B, H*A)
+            
+            # Get velocity from policy (keep nt for compatibility but don't use it for noise)
+            vt, nt = self.actor_ft.forward(xt, t, cond, True, i)  # vt: (B, H, A), nt: (B, H*A)
+            vt_flat = vt.flatten(-2, -1)  # (B, H*A)
+            
+            # Compute λ_t = a * (1 - t) per FMPO framework (Table 1)
+            one_minus_t = torch.clamp(1 - t_bc, min=1e-6)
+            lambda_t = self.noise_level_a * one_minus_t
+            
+            # Compute drift coefficients per Theorem 4.1
+            coef_vel = 1.0 + (lambda_t / 2.0) * (t_bc / one_minus_t)
+            coef_xt = (lambda_t / 2.0) / one_minus_t
+            
+            # Drift: scaled velocity + contraction term
+            drift = coef_vel * vt_flat - coef_xt * xt_flat
+            
+            # Mean after Euler step
+            mean = xt_flat + drift * dt
+            if clip_intermediate_actions:
+                mean = mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+            
+            # Transition std = √(λ_t * dt)
+            trans_std = torch.sqrt(lambda_t * dt)
+            
+            chains_mean[:, i] = mean
+            chains_stds[:, i] = trans_std
+            logprob_steps += 1
         
         # transition distribution
         chains_dist = Normal(chains_mean, chains_stds)
         
         # logprobability and entropy of the transitions
-        logprob_trans = chains_dist.log_prob(chains_next).sum(-1)               # [batchsize, self.inference_steps] sum up self.horizon_steps x self.action_dim 
+        logprob_trans = chains_dist.log_prob(chains_next).sum(-1)  # [B, K] sum over H*A
         if get_entropy:
-            entropy_trans = chains_dist.entropy().sum(-1)                       # [batchsize, self.inference_steps] Sum over all dimensions
+            entropy_trans = chains_dist.entropy().sum(-1)  # [B, K]
         
-        # logprobability of the whole markov chain.
-        logprob += logprob_trans.sum(-1)                          # [batchsize] accumulate over inference steps (Markov property)
+        # logprobability of the whole markov chain
+        logprob += logprob_trans.sum(-1)  # [B] accumulate over inference steps
         if self.logprob_debug_recalculate: 
             log.info(f"logprob_init={logprob_init.mean().item()}, logprob_trans={logprob_trans.mean().item()}")
+        
         # entropy rate estimate of the whole markov chain
         if get_entropy:
-            joint_entropy +=entropy_trans.sum(-1)
+            joint_entropy += entropy_trans.sum(-1)
         
         if get_entropy:
-            entropy_rate_est = joint_entropy/logprob_steps
+            entropy_rate_est = joint_entropy / logprob_steps
         if normalize_denoising_horizon:
             logprob = logprob / logprob_steps
             
         if normalize_act_space_dimension:
-            logprob = logprob/self.act_dim_total
+            logprob = logprob / self.act_dim_total
             if get_entropy:
-                entropy_rate_est = entropy_rate_est/self.act_dim_total
+                entropy_rate_est = entropy_rate_est / self.act_dim_total
         
         if verbose_entropy_stats and get_entropy:
             log.info(f"entropy_rate_est={entropy_rate_est.shape} Entropy Percentiles: 10%={entropy_rate_est.quantile(0.1):.2f}, 50%={entropy_rate_est.median():.2f}, 90%={entropy_rate_est.quantile(0.9):.2f}")
@@ -312,13 +338,18 @@ class PPOFlow(nn.Module):
                     ret_logprob=True
                     ):
         '''
+        Implements Theorem 4.1: Correctness for Flow RL via Diffusion-Flow Duality.
+        
+        The SDE for Z_t^θ is:
+        dZ_t = [(1 + λ_t/2 * t/(1-t)) * u_θ(Z_t, t) - (λ_t/2 * 1/(1-t)) * Z_t] dt + √λ_t dW_t
+        
         inputs:
-            cond: dict, contatinin...
+            cond: dict, containing...
                 'state': obs. observation in robotics. torch.Tensor(batchsize, cond_steps, obs_dim)
-            deterministic: bool, whether use deterministic inference or stochastic interpolate
+            eval_mode: bool, whether use deterministic inference or stochastic interpolate
             save_chains: whether to return predictions at each step
-            normalize_denoising_horizon: bool, whether to normalize time horizon when calculating the log probability.  When toggled, could reduce some hyper parameter tuning when the action space changes. 
-            normalize_act_space_dimension: bool, whether to normalize action dimension when calculating the log probability. When toggled, could reduce some hyper parameter tuning when the action space changes. 
+            normalize_denoising_horizon: bool, whether to normalize time horizon when calculating the log probability.
+            normalize_act_space_dimension: bool, whether to normalize action dimension when calculating the log probability.
             clip_intermediate_actions: bool, whether to clip intermediate actions during the flow. 
         outputs:
             1. (xt, x_chain, log_prob) when `save_chains` =True
@@ -327,65 +358,91 @@ class PPOFlow(nn.Module):
             x_chains. tensor of shape `[self.inference_steps +1 ,self.data_shape]`: x0, x1, x2, ... xK
             logprob. tensor of shape `[batchsize]` or None
         '''
-        # when doing deterministic sampling should calculate logprob again.
-        B=cond["state"].shape[0]
-        dt = (1/self.inference_steps)* torch.ones(B, self.horizon_steps, self.action_dim, device=self.device)
-        steps = torch.linspace(0, 1-1/self.inference_steps,self.inference_steps).repeat(B, 1).to(self.device)  # [batchsize, num_steps]
+        B = cond["state"].shape[0]
+        dt = 1.0 / self.inference_steps
+        sqrt_dt = dt ** 0.5
+        
+        steps = torch.linspace(0, 1 - dt, self.inference_steps).repeat(B, 1).to(self.device)  # [batchsize, num_steps]
+        
         if save_chains:
-            x_chain=torch.zeros((B, self.inference_steps+1, self.horizon_steps, self.action_dim), device=self.device)
+            x_chain = torch.zeros((B, self.inference_steps + 1, self.horizon_steps, self.action_dim), device=self.device)
         if ret_logprob:
-            log_prob=0.0 
-            log_prob_steps=0
+            log_prob = 0.0 
+            log_prob_steps = 0
             if self.logprob_debug_sample: 
                 log_prob_list = []
         
-        # sample first point
+        # sample first point from N(0, I)
         xt, log_prob_init = self.sample_first_point(B)
         if ret_logprob and account_for_initial_stochasticity:
-            log_prob+=log_prob_init
-            log_prob_steps+=1
+            log_prob += log_prob_init
+            log_prob_steps += 1
             if self.logprob_debug_sample:
                 log_prob_list.append(log_prob_init.mean().item())
         
-        xt:torch.Tensor
+        xt: torch.Tensor
         if save_chains:
             x_chain[:, 0] = xt
         
         for i in range(self.inference_steps):
-            t = steps[:,i]
-            vt, nt =self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
-            xt += vt* dt
-            if clip_intermediate_actions: # Discourage excessive exploration
-                xt = xt.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+            t = steps[:, i]  # (B,)
+            t_bc = t.view(-1, 1, 1)  # (B, 1, 1) for broadcasting with (B, H, A)
             
-            # add noise during training, also prevent too deterministic policies
-            std = nt.unsqueeze(-1).reshape(xt.shape)
-            std = torch.clamp(std, min=self.min_sampling_denoising_std)    # each value in [self.min_sampling_denoising_std, self.max_logprob_denoising_std]
-            dist = Normal(xt, std)
+            # Get velocity from policy (keep nt for compatibility but don't use it for noise)
+            vt, nt = self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
+            
+            # Compute λ_t = a * (1 - t) per FMPO framework (Table 1)
+            one_minus_t = torch.clamp(1 - t_bc, min=1e-6)
+            lambda_t = self.noise_level_a * one_minus_t
+            
+            # Compute drift coefficients per Theorem 4.1:
+            # dZ = [(1 + λ/2 * t/(1-t)) * v - (λ/2 * 1/(1-t)) * Z] dt + √λ dW
+            coef_vel = 1.0 + (lambda_t / 2.0) * (t_bc / one_minus_t)
+            coef_xt = (lambda_t / 2.0) / one_minus_t
+            
+            # Compute drift: scaled velocity + contraction term
+            drift = coef_vel * vt - coef_xt * xt
+            
+            # Euler step: compute mean after drift
+            xt_mean = xt + drift * dt
+            
+            if clip_intermediate_actions:
+                xt_mean = xt_mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+            
+            # Diffusion std = √(λ_t * dt)
+            diffusion_std = torch.sqrt(lambda_t * dt)
+            
+            # Sample from transition distribution or use mean
             if not eval_mode:
-                xt = dist.sample().clamp_(dist.loc - self.randn_clip_value * dist.scale,
-                                          dist.loc + self.randn_clip_value * dist.scale).to(self.device)
+                dist = Normal(xt_mean, diffusion_std)
+                xt = dist.sample().clamp_(xt_mean - self.randn_clip_value * diffusion_std,
+                                          xt_mean + self.randn_clip_value * diffusion_std).to(self.device)
+            else:
+                xt = xt_mean
             
             # prevent last action overflow
-            if i == self.inference_steps-1:
-                xt = xt.clamp_(self.act_min, self.act_max)                      
+            if i == self.inference_steps - 1:
+                xt = xt.clamp_(self.act_min, self.act_max)
+            
             if ret_logprob:
-                # compute logprobs for eval or train
-                logprob_transition = dist.log_prob(xt).sum(dim=(-2,-1)).to(self.device)
+                # compute logprobs using the transition distribution
+                dist = Normal(xt_mean, diffusion_std)
+                logprob_transition = dist.log_prob(xt).sum(dim=(-2, -1)).to(self.device)
                 if self.logprob_debug_sample: 
                     log_prob_list.append(logprob_transition.mean().item())
                 log_prob += logprob_transition
-                log_prob_steps+=1
+                log_prob_steps += 1
+            
             if save_chains:
-                x_chain[:, i+1] = xt
+                x_chain[:, i + 1] = xt
         
         if ret_logprob:
             if normalize_denoising_horizon:
-                log_prob = log_prob/log_prob_steps
+                log_prob = log_prob / log_prob_steps
             if normalize_act_space_dimension:
-                log_prob = log_prob/self.act_dim_total
+                log_prob = log_prob / self.act_dim_total
             if self.logprob_debug_sample:
-                transform_logprob=torch.log(1-torch.tanh(x_chain[-1])**2+1e-7).sum(dim=(-2,-1)).mean().item()
+                transform_logprob = torch.log(1 - torch.tanh(x_chain[-1])**2 + 1e-7).sum(dim=(-2, -1)).mean().item()
                 print(f"log_prob_list={log_prob_list}, transform={transform_logprob}")
         
         if ret_logprob:

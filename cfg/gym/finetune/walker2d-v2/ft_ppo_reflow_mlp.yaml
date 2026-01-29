@@ -88,7 +88,10 @@ train:
   max_noise_hold_ratio: 0.35
   max_noise_decay_ratio: 0.7
 model:
-  _target_: model.flow.ft_ppo.ppoflow.PPOFlow
+  # Switch between implementations by changing _target_:
+  #   FMPO-PPO: model.flow.ft_ppo.ppoflow_fmppo.PPOFlow (uses noise_level_a)
+  #   ReinFlow: model.flow.ft_ppo.ppoflow.PPOFlow (ignores noise_level_a)
+  _target_: model.flow.ft_ppo.ppoflow_fmppo.PPOFlow
   device: ${device}
   policy:
     _target_: model.flow.mlp_flow.FlowMLP

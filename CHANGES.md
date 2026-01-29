@@ -4,6 +4,72 @@ This document describes the **algorithmic modifications** made to the original R
 
 ---
 
+## Quick Start: Switching Between ReinFlow and FMPO-PPO
+
+This repository supports **two PPO flow implementations**:
+
+| Implementation | File | Description |
+|---------------|------|-------------|
+| **ReinFlow (Original)** | `model/flow/ft_ppo/ppoflow.py` | Original ReinFlow implementation with learned exploration noise |
+| **FMPO-PPO** | `model/flow/ft_ppo/ppoflow_fmppo.py` | FMPO implementation with tunable `noise_level_a` parameter |
+
+### Configuration
+
+Switch between implementations by changing the `model._target_` in your config YAML file:
+
+**For ReinFlow (Original):**
+```yaml
+model:
+  _target_: model.flow.ft_ppo.ppoflow.PPOFlow
+  # ... other parameters (noise_level_a is NOT needed)
+```
+
+**For FMPO-PPO:**
+```yaml
+model:
+  _target_: model.flow.ft_ppo.ppoflow_fmppo.PPOFlow
+  # ... other parameters
+  noise_level_a: 0.6  # REQUIRED: tunable noise schedule coefficient
+```
+
+### Command Line Override
+
+You can also switch implementations via command line:
+
+```bash
+# Use ReinFlow (Original)
+python script/run.py \
+  --config-dir=cfg/gym/finetune/hopper-v2 \
+  --config-name=ft_ppo_reflow_mlp \
+  model._target_=model.flow.ft_ppo.ppoflow.PPOFlow
+
+# Use FMPO-PPO
+python script/run.py \
+  --config-dir=cfg/gym/finetune/hopper-v2 \
+  --config-name=ft_ppo_reflow_mlp \
+  model._target_=model.flow.ft_ppo.ppoflow_fmppo.PPOFlow \
+  model.noise_level_a=0.6
+```
+
+### Key Differences
+
+| Aspect | ReinFlow (Original) | FMPO-PPO |
+|--------|---------------------|----------|
+| **Noise Schedule** | Learned via exploration network | Fixed: `λ_t = a * (1 - t)` |
+| **Exploration Control** | `min_logprob_denoising_std`, `max_logprob_denoising_std` | `noise_level_a` |
+| **Noise Type** | Per-step learned noise | Analytically defined decay |
+| **Drift Formulation** | Standard flow velocity | Modified drift with contraction term |
+
+### Config Compatibility
+
+Both implementations accept the same config parameters. The original ReinFlow accepts (but ignores) the `noise_level_a` parameter for compatibility. This means you can switch between implementations by only changing the `_target_` field.
+
+**Important Notes:**
+- When using **ReinFlow**: `noise_level_a` is ignored; exploration is controlled by `min_logprob_denoising_std`, `max_logprob_denoising_std`, and `noise_scheduler_type`
+- When using **FMPO-PPO**: `noise_level_a` controls the noise schedule; `min_logprob_denoising_std` and `max_logprob_denoising_std` are still used for clipping
+
+---
+
 ## Overview
 
 The primary algorithmic change is the introduction of a **tunable noise schedule parameter** `noise_level_a` that controls the noise injection in the flow matching SDE. This modification enables systematic exploration of different noise schedules and their impact on policy learning.
@@ -12,8 +78,9 @@ The primary algorithmic change is the introduction of a **tunable noise schedule
 
 ## 1. Core Algorithmic Change: Noise Schedule Parameterization
 
-### 1.1 Modified File
-**File**: `model/flow/ft_ppo/ppoflow.py`
+### 1.1 Implementation Files
+- **FMPO-PPO**: `model/flow/ft_ppo/ppoflow_fmppo.py` - Contains the `noise_level_a` implementation
+- **ReinFlow (Original)**: `model/flow/ft_ppo/ppoflow.py` - Original implementation with learned exploration noise
 
 ### 1.2 Key Change: Introduction of `noise_level_a`
 
@@ -281,13 +348,20 @@ This formulation ensures:
 ## 8. Files Modified
 
 ### Core Algorithm Changes
-- `model/flow/ft_ppo/ppoflow.py` - Added `noise_level_a` parameter and modified SDE formulation
+- `model/flow/ft_ppo/ppoflow.py` - Original ReinFlow PPOFlow implementation (restored)
+- `model/flow/ft_ppo/ppoflow_fmppo.py` - FMPO-PPO implementation with `noise_level_a` parameter and modified SDE formulation
+- `model/flow/ft_ppo/__init__.py` - Updated to export both implementations
 
 ### Supporting Infrastructure
 - `cfg/gym/finetune/*/ft_ppo_reflow_mlp.yaml` - Added `noise_level_a` and `wandb.dir` parameters
 - `script/param_search_noise_level.py` - Parameter search script
 - `script/param_search_noise_level.sh` - Parameter search script (bash)
 - `script/param_search_seed_*.sh` - Seed search scripts for multiple environments
+
+### Implementation Selection
+To switch between implementations, modify the `model._target_` in config files:
+- **ReinFlow**: `model._target_: model.flow.ft_ppo.ppoflow.PPOFlow`
+- **FMPO-PPO**: `model._target_: model.flow.ft_ppo.ppoflow_fmppo.PPOFlow`
 
 ---
 
